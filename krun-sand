@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""ai-sand: run a preset command inside a libkrun microVM, pinned to chosen NICs.
+"""krun-sand: run a preset command inside a libkrun microVM, pinned to chosen NICs.
 
 The command comes from the config file's `preset` knob. Like xargs, any extra
 arguments (from argv, or from stdin with -x) are appended to the preset's
 command line before it runs in the VM.
 
-  ai-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [--pull] [--] [ARGS...]
+  krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [--pull] [--] [ARGS...]
 
 No container engine. The pieces, outermost first:
   image   -> pulled straight from the registry (v2 API), layers unpacked into
-             ~/.cache/ai-sand/images/<digest>/rootfs. Pulled once; --pull refreshes.
+             ~/.cache/krun-sand/images/<digest>/rootfs. Pulled once; --pull refreshes.
   pasta   -> creates the user + network namespace and runs stage 2 inside it.
              egress  -> --outbound-if4/6 IFACE: every outbound socket is
                         SO_BINDTODEVICE'd to that NIC; if it's down or has no
@@ -43,19 +43,19 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_CONFIG_PATHS = [
-    os.environ.get("AI_SAND_CONFIG", ""),
-    "./ai-sand.toml",
-    os.path.expanduser("~/.config/ai-sand/config.toml"),
+    os.environ.get("KRUN_SAND_CONFIG", ""),
+    "./krun-sand.toml",
+    os.path.expanduser("~/.config/krun-sand/config.toml"),
 ]
-CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "ai-sand")
-RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "ai-sand")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "krun-sand")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "krun-sand")
 # Where to find the host's real upstreams when /etc/resolv.conf is a local stub.
 RESOLV_CONFS = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"]
 DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 def die(msg, code=2):
-    print(f"ai-sand: {msg}", file=sys.stderr)
+    print(f"krun-sand: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -276,7 +276,7 @@ def extract_layer(fileobj, root):
             try:
                 tf.extract(m, root, filter=tar_filter)
             except (tarfile.FilterError, OSError) as e:
-                print(f"ai-sand: skipping {m.name}: {e}", file=sys.stderr)
+                print(f"krun-sand: skipping {m.name}: {e}", file=sys.stderr)
 
 
 def pull(image):
@@ -296,7 +296,7 @@ def pull(image):
     digest = manifest["config"]["digest"]
     dest = os.path.join(CACHE, "images", digest.replace(":", "-"))
     if not os.path.isdir(os.path.join(dest, "rootfs")):
-        print(f"ai-sand: pulling {image} ({len(manifest['layers'])} layers)", file=sys.stderr)
+        print(f"krun-sand: pulling {image} ({len(manifest['layers'])} layers)", file=sys.stderr)
         os.makedirs(os.path.join(CACHE, "images"), exist_ok=True)
         tmp = tempfile.mkdtemp(dir=os.path.join(CACHE, "images"), prefix=".pull-")
         try:
@@ -440,7 +440,7 @@ def stage2(plan_path):
     # Private mount ns; everything below dies with this process.
     os.unshare(os.CLONE_NEWNS)
     mount(None, "/", None, MS_REC | MS_PRIVATE)
-    mount("ai-sand", run, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700")
+    mount("krun-sand", run, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700")
     upper, work, root = (os.path.join(run, d) for d in ("upper", "work", "root"))
     for d in (upper, work, root):
         os.mkdir(d)
@@ -512,11 +512,11 @@ def main():
         return stage2(sys.argv[2])
 
     ap = argparse.ArgumentParser(
-        prog="ai-sand",
+        prog="krun-sand",
         description="Run the configured preset command in a libkrun microVM, "
                     "appending ARGS xargs-style.",
     )
-    ap.add_argument("-c", "--config", help="config file (default: $AI_SAND_CONFIG, ./ai-sand.toml, ~/.config/ai-sand/config.toml)")
+    ap.add_argument("-c", "--config", help="config file (default: $KRUN_SAND_CONFIG, ./krun-sand.toml, ~/.config/krun-sand/config.toml)")
     ap.add_argument("-p", "--preset", help="override the config's `preset` knob")
     ap.add_argument("-e", "--egress", metavar="IFACE", help="override egress interface")
     ap.add_argument("-i", "--ingress", metavar="IFACE", help="override ingress interface")
@@ -553,7 +553,7 @@ def main():
     with open(plan_path, "w") as f:
         json.dump(plan, f)
 
-    print(f"ai-sand: preset={preset} egress={egress} ingress={ingress} ({cfg_path})", file=sys.stderr)
+    print(f"krun-sand: preset={preset} egress={egress} ingress={ingress} ({cfg_path})", file=sys.stderr)
     # stdin is consumed for args in xargs mode, so don't hand it to the VM.
     stdin = subprocess.DEVNULL if args.xargs else None
     # pasta (and with it the VM) goes down with us, even on SIGKILL.

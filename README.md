@@ -1,7 +1,7 @@
-# ai-sand
+# krun-sand
 
 ```
-ai-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [-l] [--pull] [--] [ARGS...]
+krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [-l] [--pull] [--] [ARGS...]
 ```
 
 Runs the active preset's `command` with `ARGS` appended (xargs-style) in a libkrun microVM, with network pinned to one NIC.
@@ -11,27 +11,27 @@ Requires `pasta` (passt), `libkrun`, `/dev/kvm` access, and Python ≥ 3.12.
 ## Examples
 
 ```sh
-ai-sand 'uname -a; cat /etc/os-release'        # default preset: sh -c
-ai-sand 'exec sh -i'                           # interactive shell
-ai-sand -p web                                 # serve $PWD read-only on <ingress-ip>:18080
-ai-sand -p tor 'wget -qO- https://check.torproject.org/api/ip'
-ai-sand -e wlan0 'wget -qO- ifconfig.me'       # different egress NIC, just this run
+krun-sand 'uname -a; cat /etc/os-release'        # default preset: sh -c
+krun-sand 'exec sh -i'                           # interactive shell
+krun-sand -p web                                 # serve $PWD read-only on <ingress-ip>:18080
+krun-sand -p tor 'wget -qO- https://check.torproject.org/api/ip'
+krun-sand -e wlan0 'wget -qO- ifconfig.me'       # different egress NIC, just this run
 
-printf '%s\n' a 'b c' | ai-sand -p echo -x     # args from stdin (shell-quoted)
-find . -name '*.py' -print0 | ai-sand -p lint -x -0
+printf '%s\n' a 'b c' | krun-sand -p echo -x     # args from stdin (shell-quoted)
+find . -name '*.py' -print0 | krun-sand -p lint -x -0
 
-ai-sand -n -p web                              # print pasta cmd + VM plan, don't run
-ai-sand -l                                     # list presets (* = active)
-ai-sand --pull 'apk --version'                 # re-resolve the image tag first
+krun-sand -n -p web                              # print pasta cmd + VM plan, don't run
+krun-sand -l                                     # list presets (* = active)
+krun-sand --pull 'apk --version'                 # re-resolve the image tag first
 ```
 
-The VM's exit code is `ai-sand`'s exit code.
+The VM's exit code is `krun-sand`'s exit code.
 
 ## Flags
 
 | flag | |
 |---|---|
-| `-c FILE` | config (default: `$AI_SAND_CONFIG`, `./ai-sand.toml`, `~/.config/ai-sand/config.toml`) |
+| `-c FILE` | config (default: `$KRUN_SAND_CONFIG`, `./krun-sand.toml`, `~/.config/krun-sand/config.toml`) |
 | `-p NAME` | preset to run (overrides `preset =`) |
 | `-e IFACE` / `-i IFACE` | override egress / ingress NIC |
 | `-x` | append args read from stdin (VM gets no stdin) |
@@ -91,8 +91,8 @@ workdir = "/src"
 - **Filesystem:** writes go to a tmpfs overlay and are discarded when the run ends. Mounts are host bind mounts and changes to them persist.
 - **Network:** host loopback services are not reachable, and only the listed `tcp`/`udp` ports are forwarded, on the ingress NIC only. DNS also goes out the egress NIC.
 - **Guest user:** the guest runs as root. The preset `user` key is rejected.
-- **Image cache:** `~/.cache/ai-sand/images/<digest>/`. Delete it to reclaim space.
-- **Run state:** `$XDG_RUNTIME_DIR/ai-sand/`. It's removed when the run exits. If `ai-sand` is killed, the VM dies with it.
+- **Image cache:** `~/.cache/krun-sand/images/<digest>/`. Delete it to reclaim space.
+- **Run state:** `$XDG_RUNTIME_DIR/krun-sand/`. It's removed when the run exits. If `krun-sand` is killed, the VM dies with it.
 
 ## socks-tun (Tor / SOCKS5 egress)
 

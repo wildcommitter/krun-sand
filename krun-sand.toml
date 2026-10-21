@@ -1,4 +1,4 @@
-# ai-sand config. The `preset` knob picks which [presets.*] entry runs.
+# krun-sand config. The `preset` knob picks which [presets.*] entry runs.
 # Extra CLI args (or stdin args with -x) are appended to its command, xargs-style.
 preset = "shell"
 
@@ -14,13 +14,13 @@ udp = []
 
 [presets.shell]
 image = "docker.io/library/alpine:latest"
-command = ["sh", "-c"]   # ai-sand 'echo hi; uname -a'
+command = ["sh", "-c"]   # krun-sand 'echo hi; uname -a'
 cpus = 2
 memory_mib = 1024
 
 [presets.echo]
 image = "docker.io/library/alpine:latest"
-command = ["echo", "args:"]  # printf '%s\n' a b c | ai-sand -p echo -x
+command = ["echo", "args:"]  # printf '%s\n' a b c | krun-sand -p echo -x
 
 [presets.web]
 image = "docker.io/library/python:3.12-slim"

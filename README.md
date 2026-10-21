@@ -1,12 +1,12 @@
 # krun-sand
 
 ```
-krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [-l] [--pull] [--] [ARGS...]
+krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [-l] [--pull] [--clean] [--] [ARGS...]
 ```
 
 Runs the active preset's `command` with `ARGS` appended (xargs-style) in a libkrun microVM, with network pinned to one NIC.
 
-Requires `pasta` (passt), `libkrun`, `/dev/kvm` access, and Python ≥ 3.12.
+Requires `pasta` (passt), `libkrun`, `newuidmap`/`newgidmap` (shadow-utils) with a range for you in `/etc/subuid` and `/etc/subgid`, `/dev/kvm` access, and Python ≥ 3.12.
 
 ## Examples
 
@@ -23,6 +23,7 @@ find . -name '*.py' -print0 | krun-sand -p lint -x -0
 krun-sand -n -p web                              # print pasta cmd + VM plan, don't run
 krun-sand -l                                     # list presets (* = active)
 krun-sand --pull 'apk --version'                 # re-resolve the image tag first
+krun-sand --clean                                # delete the image cache
 ```
 
 The VM's exit code is `krun-sand`'s exit code.
@@ -39,6 +40,7 @@ The VM's exit code is `krun-sand`'s exit code.
 | `-n` | dry run |
 | `-l` | list presets |
 | `--pull` | refresh the image even if cached |
+| `--clean` | delete the image cache |
 
 ## Config
 
@@ -90,8 +92,8 @@ workdir = "/src"
 
 - **Filesystem:** writes go to a tmpfs overlay and are discarded when the run ends. Mounts are host bind mounts and changes to them persist.
 - **Network:** host loopback services are not reachable, and only the listed `tcp`/`udp` ports are forwarded, on the ingress NIC only. DNS also goes out the egress NIC.
-- **Guest user:** the guest runs as root. The preset `user` key is rejected.
-- **Image cache:** `~/.cache/krun-sand/images/<digest>/`. Delete it to reclaim space.
+- **Guest user:** the guest runs as root. The preset `user` key is rejected. Image file owners are preserved and the guest can `chown` to any id in your subuid range.
+- **Image cache:** `~/.cache/krun-sand/images/<digest>/`. Every downloaded blob must match its sha256 digest and size before it is cached. A tag lookup is trusted as the registry serves it, so write `image@sha256:…` to pin it. Files in the cache belong to your subuids, so use `krun-sand --clean` rather than `rm`.
 - **Run state:** `$XDG_RUNTIME_DIR/krun-sand/`. It's removed when the run exits. If `krun-sand` is killed, the VM dies with it.
 
 ## socks-tun (Tor / SOCKS5 egress)

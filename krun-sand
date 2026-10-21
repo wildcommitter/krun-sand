@@ -5,23 +5,29 @@ The command comes from the config file's `preset` knob. Like xargs, any extra
 arguments (from argv, or from stdin with -x) are appended to the preset's
 command line before it runs in the VM.
 
-  krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [--pull] [--] [ARGS...]
+  krun-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [--pull] [--clean] [--] [ARGS...]
 
 No container engine. The pieces, outermost first:
-  image   -> pulled straight from the registry (v2 API), layers unpacked into
-             ~/.cache/krun-sand/images/<digest>/rootfs. Pulled once; --pull refreshes.
-  pasta   -> creates the user + network namespace and runs stage 2 inside it.
+  userns  -> our uid -> root, /etc/subuid + /etc/subgid ranges -> 1..N (via
+             newuidmap), so image files keep their owners and chown works.
+  image   -> pulled straight from the registry (v2 API); every blob is hashed
+             while it streams and must match its digest and size before it's
+             moved into ~/.cache/krun-sand/images/<digest>/. Manifests are
+             verified when referenced by digest (pin image@sha256:... to cover
+             the tag lookup too). Pulled once; --pull refreshes.
+  netns   -> the VM process unshares one; pasta attaches to it from outside
+             and quits when it's gone.
              egress  -> --outbound-if4/6 IFACE: every outbound socket is
                         SO_BINDTODEVICE'd to that NIC; if it's down or has no
                         address the run fails instead of using another route.
              ingress -> -t/-u ADDR%IFACE/PORT: forwarded ports listen only on
                         that NIC.
-  mounts  -> stage 2 unshares a mount namespace: tmpfs + overlayfs over the
-             cached rootfs (writes vanish with the run), bind mounts for
+  mounts  -> the VM process unshares a mount namespace: tmpfs + overlayfs over
+             the cached rootfs (writes vanish with the run), bind mounts for
              `mounts`, optional read-only remount of the root.
   libkrun -> loaded via ctypes; krun_start_enter turns the process into the
              VMM. The guest's sockets are proxied by it (TSI), so they live in
-             pasta's netns.
+             the netns pasta serves.
 """
 
 import argparse
@@ -279,21 +285,59 @@ def extract_layer(fileobj, root):
                 print(f"krun-sand: skipping {m.name}: {e}", file=sys.stderr)
 
 
+class Verified:
+    """Read-through over a blob that hashes as it goes; check() drains the
+    rest and compares digest and size against the descriptor."""
+
+    def __init__(self, resp, digest, size=None):
+        algo, _, self.want = digest.partition(":")
+        if algo not in ("sha256", "sha512"):
+            die(f"unsupported digest algorithm in {digest!r}")
+        self.resp, self.digest, self.size = resp, digest, size
+        self.hash, self.seen = hashlib.new(algo), 0
+
+    def read(self, n=-1):
+        data = self.resp.read(n)
+        self.hash.update(data)
+        self.seen += len(data)
+        return data
+
+    def check(self):
+        while self.read(1 << 20):
+            pass
+        if self.hash.hexdigest() != self.want:
+            die(f"digest mismatch: expected {self.digest}, got "
+                f"{self.digest.partition(':')[0]}:{self.hash.hexdigest()}", 1)
+        if self.size is not None and self.seen != self.size:
+            die(f"size mismatch for {self.digest}: expected {self.size}, got {self.seen}", 1)
+
+
+def get_manifest(reg, ref):
+    """By digest: verified. By tag: trusted as served (pin image@sha256:... to avoid)."""
+    with reg.get(f"/manifests/{ref}", MANIFEST_TYPES) as r:
+        if ":" in ref:
+            r = Verified(r, ref)
+            data = r.read()
+            r.check()
+        else:
+            data = r.read()
+    return json.loads(data)
+
+
 def pull(image):
     host, repo, ref = parse_ref(image)
     reg = Registry(host, repo)
-    with reg.get(f"/manifests/{ref}", MANIFEST_TYPES) as r:
-        manifest = json.load(r)
+    manifest = get_manifest(reg, ref)
     if "manifests" in manifest:  # index: pick our platform
         for m in manifest["manifests"]:
             p = m.get("platform", {})
             if p.get("os") == "linux" and p.get("architecture") == ARCH:
-                with reg.get(f"/manifests/{m['digest']}", MANIFEST_TYPES) as r:
-                    manifest = json.load(r)
+                manifest = get_manifest(reg, m["digest"])
                 break
         else:
             die(f"{image}: no linux/{ARCH} image in index")
-    digest = manifest["config"]["digest"]
+    config_desc = manifest["config"]
+    digest = config_desc["digest"]
     dest = os.path.join(CACHE, "images", digest.replace(":", "-"))
     if not os.path.isdir(os.path.join(dest, "rootfs")):
         print(f"krun-sand: pulling {image} ({len(manifest['layers'])} layers)", file=sys.stderr)
@@ -302,13 +346,17 @@ def pull(image):
         try:
             rootfs = os.path.join(tmp, "rootfs")
             os.mkdir(rootfs)
+            # Unpacked into tmp while hashing; only renamed into the cache once
+            # every blob matched its digest.
             for layer in manifest["layers"]:
                 with reg.get(f"/blobs/{layer['digest']}") as r:
-                    extract_layer(r, os.path.realpath(rootfs))
+                    blob = Verified(r, layer["digest"], layer.get("size"))
+                    extract_layer(blob, os.path.realpath(rootfs))
+                    blob.check()
             with reg.get(f"/blobs/{digest}") as r:
-                config = r.read()
-            if "sha256:" + hashlib.sha256(config).hexdigest() != digest:
-                die(f"{image}: config digest mismatch")
+                blob = Verified(r, digest, config_desc.get("size"))
+                config = blob.read()
+                blob.check()
             with open(os.path.join(tmp, "config.json"), "wb") as f:
                 f.write(config)
             rm(dest)
@@ -396,7 +444,112 @@ def build_plan(cfg, args):
     return plan, pasta, preset_name, egress, ingress
 
 
-# --- stage 2: inside pasta's userns + netns -----------------------------------
+# --- namespaces ----------------------------------------------------------------
+
+def subid_range(path, uid):
+    """First /etc/subuid-style range for us: (start, count) or None."""
+    names = {str(uid)}
+    try:
+        import pwd
+        names.add(pwd.getpwuid(uid).pw_name)
+    except KeyError:
+        pass
+    try:
+        with open(path) as f:
+            for line in f:
+                who, _, rest = line.strip().partition(":")
+                start, _, count = rest.partition(":")
+                if who in names and start.isdigit() and count.isdigit():
+                    return int(start), int(count)
+    except OSError:
+        pass
+    return None
+
+
+def enter_userns():
+    """Become root in a new user namespace: our uid/gid -> 0 and the
+    /etc/subuid + /etc/subgid ranges -> 1..N, so image files keep their
+    owners and the guest can chown. newuidmap has to write the maps from
+    outside, so a forked helper does it once we've unshared."""
+    uid, gid = os.getuid(), os.getgid()
+    subu, subg = subid_range("/etc/subuid", uid), subid_range("/etc/subgid", uid)
+    ready_r, ready_w = os.pipe()
+    done_r, done_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.read(ready_r, 1)
+        target, ok = str(os.getppid()), True
+        if subu and subg:
+            for tool, own, (start, count) in (("newuidmap", uid, subu), ("newgidmap", gid, subg)):
+                ok = ok and subprocess.call([tool, target, "0", str(own), "1",
+                                             "1", str(start), str(count)]) == 0
+        os.write(done_w, b"1" if ok else b"0")
+        os._exit(0)
+    os.unshare(os.CLONE_NEWUSER)
+    os.write(ready_w, b"x")
+    ok = os.read(done_r, 1) == b"1"
+    os.waitpid(pid, 0)
+    if not ok:
+        die("newuidmap/newgidmap failed", 1)
+    if not (subu and subg):
+        print("krun-sand: no /etc/subuid + /etc/subgid range; only root exists "
+              "in the sandbox and chown to other ids will fail", file=sys.stderr)
+        with open("/proc/self/setgroups", "w") as f:
+            f.write("deny")
+        with open("/proc/self/uid_map", "w") as f:
+            f.write(f"0 {uid} 1")
+        with open("/proc/self/gid_map", "w") as f:
+            f.write(f"0 {gid} 1")
+    os.setresgid(0, 0, 0)
+    os.setresuid(0, 0, 0)
+
+
+def run_vm(plan, pasta, devnull_stdin):
+    """Fork the VM process into a fresh netns, let pasta wire that netns up
+    from outside (it only quits once the netns is gone), then let it boot."""
+    ready_r, ready_w = os.pipe()
+    go_r, go_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(ready_r)
+            os.close(go_w)
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+            os.unshare(os.CLONE_NEWNET)
+            os.write(ready_w, b"x")
+            if os.read(go_r, 1) != b"x":
+                os._exit(1)
+            if devnull_stdin:
+                fd = os.open(os.devnull, os.O_RDONLY)
+                os.dup2(fd, 0)
+                os.close(fd)
+            stage2(plan)
+        except SystemExit as e:
+            os._exit(e.code if isinstance(e.code, int) else 1)
+        finally:
+            os._exit(1)
+    os.close(ready_w)
+    os.close(go_r)
+    # The VMM ignores SIGTERM; take it down hard with us.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: os.kill(pid, signal.SIGKILL))
+    os.read(ready_r, 1)
+    netns = ["--netns", f"/proc/{pid}/ns/net", "--netns-only"]
+    if subprocess.call(pasta + netns) != 0:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        die("pasta failed to set up the network namespace", 1)
+    os.write(go_w, b"x")
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+            return os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) \
+                else 128 + os.WTERMSIG(status)
+        except KeyboardInterrupt:
+            pass  # the tty's ^C reached the guest too; keep waiting
+
+
+# --- stage 2: VM process, in its own netns + mount ns ---------------------------
 
 libc = ctypes.CDLL(None, use_errno=True)
 PR_SET_PDEATHSIG, PR_SET_NO_NEW_PRIVS = 1, 38
@@ -430,9 +583,7 @@ def cstrings(items):
     return arr
 
 
-def stage2(plan_path):
-    with open(plan_path) as f:
-        plan = json.load(f)
+def stage2(plan):
     run = plan["run"]
     with open(os.path.join(plan["image_dir"], "config.json")) as f:
         icfg = json.load(f).get("config") or {}
@@ -500,7 +651,6 @@ def stage2(plan_path):
         json.dump({"Cmd": argv, "Env": [f"{k}={v}" for k, v in env.items()],
                    "WorkingDir": workdir}, f)
     call("krun_set_env", cstrings([]))
-    os.unlink(plan_path)
     rc = krun.krun_start_enter(ctx)  # only returns on failure
     die(f"krun_start_enter: {os.strerror(-rc)}", 1)
 
@@ -508,9 +658,6 @@ def stage2(plan_path):
 # --- main ----------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--stage2":
-        return stage2(sys.argv[2])
-
     ap = argparse.ArgumentParser(
         prog="krun-sand",
         description="Run the configured preset command in a libkrun microVM, "
@@ -525,10 +672,17 @@ def main():
     ap.add_argument("-n", "--dry-run", action="store_true", help="print the pasta command and VM plan, don't run")
     ap.add_argument("-l", "--list", action="store_true", help="list presets and exit")
     ap.add_argument("--pull", action="store_true", help="re-resolve the image tag and pull if it changed")
+    ap.add_argument("--clean", action="store_true", help="delete the image cache and exit")
     ap.add_argument("args", nargs=argparse.REMAINDER, help="appended to the preset command")
     args = ap.parse_args()
     if args.args and args.args[0] == "--":
         args.args = args.args[1:]
+
+    if args.clean:
+        # Cache files belong to subuids; only the namespace can delete them.
+        enter_userns()
+        rm(CACHE)
+        return 0
 
     cfg, cfg_path = load_config(args.config)
 
@@ -540,37 +694,21 @@ def main():
         return 0
 
     plan, pasta, preset, egress, ingress = build_plan(cfg, args)
-    stage2_cmd = [sys.executable, "-I", os.path.abspath(__file__), "--stage2"]
     if args.dry_run:
-        print(shlex.join(pasta + ["--"] + stage2_cmd + ["PLAN"]))
+        print(shlex.join(pasta + ["--netns", "/proc/VM_PID/ns/net", "--netns-only"]))
         print(json.dumps(plan, indent=2))
         return 0
 
+    enter_userns()
     plan["image_dir"] = ensure_image(plan["image"], args.pull)
     os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
     plan["run"] = tempfile.mkdtemp(dir=RUNTIME, prefix=f"{preset}-")
-    plan_path = plan["run"] + ".json"
-    with open(plan_path, "w") as f:
-        json.dump(plan, f)
-
     print(f"krun-sand: preset={preset} egress={egress} ingress={ingress} ({cfg_path})", file=sys.stderr)
-    # stdin is consumed for args in xargs mode, so don't hand it to the VM.
-    stdin = subprocess.DEVNULL if args.xargs else None
-    # pasta (and with it the VM) goes down with us, even on SIGKILL.
-    proc = subprocess.Popen(pasta + ["--"] + stage2_cmd + [plan_path], stdin=stdin,
-                            preexec_fn=lambda: libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0))
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda s, _: proc.send_signal(s))
     try:
-        while True:
-            try:
-                return proc.wait()
-            except KeyboardInterrupt:
-                pass  # the tty's ^C reached pasta and the guest too; keep waiting
+        # stdin is consumed for args in xargs mode, so don't hand it to the VM.
+        return run_vm(plan, pasta, devnull_stdin=args.xargs)
     finally:
-        rm(plan_path)
-        os.rmdir(plan["run"])  # the tmpfs on it was in the run's mount ns
-
+        os.rmdir(plan["run"])  # the tmpfs on it was in the VM's mount ns
 
 if __name__ == "__main__":
     sys.exit(main())

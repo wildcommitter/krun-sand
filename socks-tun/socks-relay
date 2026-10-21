@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""socks-relay: the userspace half of socks-tun (stdlib only).
+
+nftables DNATs traffic bound to the TUN device here. TCP connections are
+re-dialed through the SOCKS5 proxy to their original destination
+(SO_ORIGINAL_DST). DNS queries (udp/53 and tcp/53) are answered by:
+  PROXY_TYPE=socks5  DNS_UPSTREAM, as DNS-over-TCP through the proxy
+                     (plain SOCKS5 has no resolver of its own).
+  PROXY_TYPE=tor     Tor's DNSPort (TOR_DNS_PORT), which resolves over Tor.
+Either way no lookup ever leaves directly. If the proxy or resolver is
+unreachable the client just gets no answer / a closed connection.
+"""
+
+import asyncio
+import ipaddress
+import os
+import socket
+import struct
+import sys
+from urllib.parse import unquote, urlsplit
+
+SO_ORIGINAL_DST = 80
+
+url = urlsplit(os.environ.get("SOCKS_URL", "socks5://127.0.0.1:9050"))
+if url.scheme not in ("socks5", "socks5h"):
+    sys.exit(f"socks-relay: unsupported proxy scheme {url.scheme!r}")
+PROXY = (url.hostname, url.port or 1080)
+AUTH = (unquote(url.username or ""), unquote(url.password or "")) if url.username else None
+
+LISTEN = os.environ.get("TUN_ADDR", "10.66.66.1")
+TCP_PORT = int(os.environ.get("RELAY_TCP_PORT", "12345"))
+DNS_PORT = int(os.environ.get("RELAY_DNS_PORT", "10053"))
+_dns_host, _, _dns_port = os.environ.get("DNS_UPSTREAM", "1.1.1.1:53").rpartition(":")
+DNS_UPSTREAM = (_dns_host.strip("[]"), int(_dns_port))
+
+PROXY_TYPE = os.environ.get("PROXY_TYPE", "socks5")
+if PROXY_TYPE not in ("socks5", "tor"):
+    sys.exit(f"socks-relay: PROXY_TYPE must be socks5 or tor, not {PROXY_TYPE!r}")
+_tor_host, _, _tor_port = os.environ.get("TOR_DNS_PORT", "127.0.0.1:9053").rpartition(":")
+TOR_DNS = (_tor_host.strip("[]"), int(_tor_port))
+
+
+def log(*a):
+    print("socks-relay:", *a, file=sys.stderr, flush=True)
+
+
+async def socks_connect(host, port):
+    r, w = await asyncio.open_connection(*PROXY)
+    try:
+        w.write(b"\x05\x01\x02" if AUTH else b"\x05\x01\x00")
+        _, method = await r.readexactly(2)
+        if method == 2 and AUTH:
+            u, p = (s.encode() for s in AUTH)
+            w.write(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+            if (await r.readexactly(2))[1] != 0:
+                raise ConnectionError("proxy auth rejected")
+        elif method != 0:
+            raise ConnectionError(f"proxy refused auth method ({method})")
+
+        try:
+            ip = ipaddress.ip_address(host)
+            addr = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+        except ValueError:
+            addr = b"\x03" + bytes([len(host)]) + host.encode()
+        w.write(b"\x05\x01\x00" + addr + struct.pack("!H", port))
+
+        _, rep, _, atyp = await r.readexactly(4)
+        if rep != 0:
+            raise ConnectionError(f"proxy CONNECT {host}:{port} failed (reply {rep})")
+        alen = {1: 4, 4: 16}.get(atyp) or (await r.readexactly(1))[0]
+        await r.readexactly(alen + 2)
+        return r, w
+    except BaseException:
+        w.close()
+        raise
+
+
+async def pipe(r, w):
+    try:
+        while data := await r.read(65536):
+            w.write(data)
+            await w.drain()
+        if w.can_write_eof():
+            w.write_eof()
+    except (ConnectionError, OSError):
+        w.close()
+
+
+async def handle_tcp(cr, cw):
+    sock = cw.get_extra_info("socket")
+    port, raw = struct.unpack("!2xH4s8x", sock.getsockopt(socket.SOL_IP, SO_ORIGINAL_DST, 16))
+    dst = (socket.inet_ntoa(raw), port)
+    if port == 53:
+        await serve_tcp_dns(cr, cw)
+        return
+    try:
+        pr, pw = await asyncio.wait_for(socks_connect(*dst), 30)
+    except Exception as e:
+        log(f"tcp {dst[0]}:{dst[1]}: {e}")
+        cw.close()
+        return
+    try:
+        await asyncio.gather(pipe(cr, pw), pipe(pr, cw))
+    finally:
+        pw.close()
+        cw.close()
+
+
+async def dns_via_socks(query):
+    r, w = await asyncio.wait_for(socks_connect(*DNS_UPSTREAM), 15)
+    try:
+        w.write(struct.pack("!H", len(query)) + query)
+        await w.drain()
+        (n,) = struct.unpack("!H", await asyncio.wait_for(r.readexactly(2), 15))
+        return await r.readexactly(n)
+    finally:
+        w.close()
+
+
+async def dns_via_tor(query):
+    loop = asyncio.get_running_loop()
+    with socket.socket(socket.AF_INET6 if ":" in TOR_DNS[0] else socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setblocking(False)
+        await loop.sock_connect(s, TOR_DNS)
+        await loop.sock_sendall(s, query)
+        return await asyncio.wait_for(loop.sock_recv(s, 65535), 15)
+
+
+dns_query = dns_via_tor if PROXY_TYPE == "tor" else dns_via_socks
+DNS_DESC = (f"tor dnsport {TOR_DNS[0]}:{TOR_DNS[1]}" if PROXY_TYPE == "tor"
+            else f"{DNS_UPSTREAM[0]}:{DNS_UPSTREAM[1]} over tcp via proxy")
+
+
+async def serve_tcp_dns(cr, cw):
+    """Answer length-prefixed DNS-over-TCP queries locally via dns_query."""
+    try:
+        while True:
+            (n,) = struct.unpack("!H", await cr.readexactly(2))
+            ans = await dns_query(await cr.readexactly(n))
+            cw.write(struct.pack("!H", len(ans)) + ans)
+            await cw.drain()
+    except asyncio.IncompleteReadError:
+        pass
+    except Exception as e:
+        log(f"dns/tcp via {DNS_DESC}: {e!r}")
+    finally:
+        cw.close()
+
+
+class DNSRelay(asyncio.DatagramProtocol):
+    def __init__(self):
+        self.tasks = set()
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        t = asyncio.create_task(self.resolve(data, addr))
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
+
+    async def resolve(self, query, addr):
+        try:
+            self.transport.sendto(await dns_query(query), addr)
+        except Exception as e:
+            log(f"dns via {DNS_DESC}: {e!r}")
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    server = await asyncio.start_server(handle_tcp, LISTEN, TCP_PORT)
+    await loop.create_datagram_endpoint(DNSRelay, local_addr=(LISTEN, DNS_PORT))
+    log(f"tcp {LISTEN}:{TCP_PORT}, dns {LISTEN}:{DNS_PORT} -> {PROXY_TYPE} {url.scheme}://{PROXY[0]}:{PROXY[1]} (dns: {DNS_DESC})")
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

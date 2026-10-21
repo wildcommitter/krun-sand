@@ -1,0 +1,40 @@
+# ai-sand config. The `preset` knob picks which [presets.*] entry runs.
+# Extra CLI args (or stdin args with -x) are appended to its command, xargs-style.
+preset = "shell"
+
+[network]
+egress  = "enp6s0f0"     # all outbound traffic is bound to this NIC (fails closed if it's down)
+ingress = "enp6s0f0"     # forwarded ports listen only on this NIC's addresses
+ipv6 = false
+host_loopback = false    # true = sandbox may reach host services via the gateway address
+tcp = []                 # e.g. ["18080:8080"]  host 18080 on ingress NIC -> VM 8080
+udp = []
+# dns = ["1.1.1.1"]     # resolvers inside the VM (default: host resolver, reached via egress)
+# addr_from = "enp6s0f0" # NIC whose addr/routes the netns copies (default: egress)
+
+[presets.shell]
+image = "docker.io/library/alpine:latest"
+command = ["sh", "-c"]   # ai-sand 'echo hi; uname -a'
+cpus = 2
+memory_mib = 1024
+
+[presets.echo]
+image = "docker.io/library/alpine:latest"
+command = ["echo", "args:"]  # printf '%s\n' a b c | ai-sand -p echo -x
+
+[presets.web]
+image = "docker.io/library/python:3.12-slim"
+command = ["python3", "-m", "http.server", "8080"]
+cpus = 1
+memory_mib = 512
+workdir = "/srv"
+mounts = ["$PWD:/srv:ro"]
+network = { tcp = ["18080:8080"] }
+
+[presets.tor]
+# Egress through the socks-tun service (socks-tun/): every TCP connection goes
+# via the SOCKS5 proxy (Tor by default), DNS too; anything else is dropped.
+# socks0 has no gateway, so netns addressing is copied from the LAN NIC.
+image = "docker.io/library/alpine:latest"
+command = ["sh", "-c"]
+network = { egress = "socks0", ingress = "socks0", addr_from = "enp6s0f0" }

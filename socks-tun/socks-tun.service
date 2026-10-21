@@ -1,0 +1,35 @@
+[Unit]
+Description=TUN interface tunneled through a SOCKS5 proxy
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/socks-tun.conf
+# '+' = run as root; the relay itself runs unprivileged.
+ExecStartPre=+/usr/local/lib/socks-tun/socks-tun up
+ExecStart=/usr/local/lib/socks-tun/socks-relay
+ExecStopPost=+/usr/local/lib/socks-tun/socks-tun down
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Only the root ExecStartPre needs a device (to create the TUN).
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

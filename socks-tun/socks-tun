@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# socks-tun: bring up / tear down a TUN device whose traffic is handed to
+# socks-relay (and from there to a SOCKS5 proxy) by nftables.
+#
+# Anything bound to the device (SO_BINDTODEVICE, e.g. pasta --outbound-if4,
+# curl --interface) is routed into it via a policy rule. nftables then:
+#   tcp           -> DNAT to the relay's transparent port  (-> SOCKS5 CONNECT)
+#   udp/53 (DNS)  -> DNAT to the relay's DNS port          (-> Tor DNSPort, or
+#                    DNS-over-TCP via SOCKS5, per PROXY_TYPE)
+#   everything else (other udp, icmp, ipv6) -> dropped
+# The device never has a reader, so nothing that reaches it goes anywhere.
+#
+#   socks-tun up|down|status
+set -euo pipefail
+
+if [[ -z "${TUN_DEV:-}" && -r "${SOCKS_TUN_CONF:-/etc/socks-tun.conf}" ]]; then
+    # shellcheck disable=SC1090
+    . "${SOCKS_TUN_CONF:-/etc/socks-tun.conf}"
+fi
+: "${TUN_DEV:=socks0}" "${TUN_ADDR:=10.66.66.1}" "${TABLE:=6666}"
+: "${RELAY_TCP_PORT:=12345}" "${RELAY_DNS_PORT:=10053}"
+
+nft_table="socks_tun_${TUN_DEV//[^a-zA-Z0-9_]/_}"
+
+down() {
+    ip rule del pref "$TABLE" 2>/dev/null || true
+    ip route flush table "$TABLE" 2>/dev/null || true
+    ip tuntap del dev "$TUN_DEV" mode tun 2>/dev/null || true
+    nft delete table inet "$nft_table" 2>/dev/null || true
+}
+
+up() {
+    down
+    # Firewall first: rules match by name, so they're in place before the
+    # device exists and there's no window where bound traffic is unfiltered.
+    nft -f - <<EOF
+table inet $nft_table {
+    chain nat_out {
+        type nat hook output priority dstnat; policy accept;
+        oifname "$TUN_DEV" meta nfproto ipv4 udp dport 53 dnat ip to $TUN_ADDR:$RELAY_DNS_PORT
+        oifname "$TUN_DEV" meta nfproto ipv4 meta l4proto tcp dnat ip to $TUN_ADDR:$RELAY_TCP_PORT
+    }
+    chain filter_out {
+        type filter hook output priority filter; policy accept;
+        oifname "$TUN_DEV" meta nfproto ipv4 ct status dnat ip daddr $TUN_ADDR accept
+        oifname "$TUN_DEV" counter drop
+    }
+    chain post {
+        type filter hook postrouting priority filter; policy accept;
+        oifname "$TUN_DEV" counter drop
+    }
+    chain forward_out {
+        type filter hook forward priority filter; policy accept;
+        oifname "$TUN_DEV" drop
+        iifname "$TUN_DEV" drop
+    }
+}
+EOF
+    ip tuntap add dev "$TUN_DEV" mode tun
+    sysctl -qw "net.ipv6.conf.$TUN_DEV.disable_ipv6=1"
+    ip addr add "$TUN_ADDR/32" dev "$TUN_DEV"
+    ip link set "$TUN_DEV" up
+    ip route add default dev "$TUN_DEV" table "$TABLE"
+    ip rule add oif "$TUN_DEV" lookup "$TABLE" pref "$TABLE"
+}
+
+status() {
+    ip -br addr show dev "$TUN_DEV"
+    ip rule show pref "$TABLE"
+    ip route show table "$TABLE"
+    nft list table inet "$nft_table"
+}
+
+case "${1:-}" in
+    up|down|status) "$1" ;;
+    *) echo "usage: $0 up|down|status" >&2; exit 2 ;;
+esac

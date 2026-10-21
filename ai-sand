@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""ai-sand: run a preset command inside a libkrun microVM, pinned to chosen NICs.
+
+The command comes from the config file's `preset` knob. Like xargs, any extra
+arguments (from argv, or from stdin with -x) are appended to the preset's
+command line before it runs in the VM.
+
+  ai-sand [-c CONFIG] [-p PRESET] [-e IFACE] [-i IFACE] [-x [-0]] [-n] [--pull] [--] [ARGS...]
+
+No container engine. The pieces, outermost first:
+  image   -> pulled straight from the registry (v2 API), layers unpacked into
+             ~/.cache/ai-sand/images/<digest>/rootfs. Pulled once; --pull refreshes.
+  pasta   -> creates the user + network namespace and runs stage 2 inside it.
+             egress  -> --outbound-if4/6 IFACE: every outbound socket is
+                        SO_BINDTODEVICE'd to that NIC; if it's down or has no
+                        address the run fails instead of using another route.
+             ingress -> -t/-u ADDR%IFACE/PORT: forwarded ports listen only on
+                        that NIC.
+  mounts  -> stage 2 unshares a mount namespace: tmpfs + overlayfs over the
+             cached rootfs (writes vanish with the run), bind mounts for
+             `mounts`, optional read-only remount of the root.
+  libkrun -> loaded via ctypes; krun_start_enter turns the process into the
+             VMM. The guest's sockets are proxied by it (TSI), so they live in
+             pasta's netns.
+"""
+
+import argparse
+import ctypes
+import hashlib
+import json
+import os
+import platform
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_CONFIG_PATHS = [
+    os.environ.get("AI_SAND_CONFIG", ""),
+    "./ai-sand.toml",
+    os.path.expanduser("~/.config/ai-sand/config.toml"),
+]
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "ai-sand")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "ai-sand")
+# Where to find the host's real upstreams when /etc/resolv.conf is a local stub.
+RESOLV_CONFS = ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"]
+DEFAULT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def die(msg, code=2):
+    print(f"ai-sand: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config(path):
+    candidates = [path] if path else [p for p in DEFAULT_CONFIG_PATHS if p]
+    for p in candidates:
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                return tomllib.load(f), os.path.abspath(p)
+    die(f"no config found (tried: {', '.join(candidates)})")
+
+
+# --- network (pasta) ---------------------------------------------------------
+
+def iface_addrs(iface, family):
+    """Return global addresses on iface for family 'inet' or 'inet6'."""
+    out = subprocess.run(
+        ["ip", "-j", "addr", "show", "dev", iface],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        die(f"interface {iface!r} not found: {out.stderr.strip()}")
+    info = json.loads(out.stdout)[0]
+    if "UP" not in info.get("flags", []):
+        die(f"interface {iface!r} is down")
+    return [
+        a["local"] for a in info.get("addr_info", [])
+        if a["family"] == family and a.get("scope") == "global"
+    ]
+
+
+def port_specs(flag, ports, iface, addrs):
+    """Build pasta -t/-u specs bound to the ingress interface's addresses."""
+    args = []
+    for port in ports:
+        port = str(port)
+        for addr in addrs or [""]:
+            args += [flag, f"{addr}%{iface}/{port}"]
+    return args
+
+
+def host_resolvers(ipv6):
+    """Upstream nameservers from the host, skipping loopback stubs: pasta's
+    sockets are bound to the egress NIC, so a 127.0.0.53 stub is unreachable
+    and queries must go to a real server out that NIC like everything else."""
+    for path in RESOLV_CONFS:
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        servers = [l.split()[1] for l in lines if l.startswith("nameserver") and len(l.split()) > 1]
+        servers = [s for s in servers if not s.startswith(("127.", "::1"))
+                   and (ipv6 or ":" not in s)]
+        if servers:
+            return servers
+    die("no non-loopback host resolver found; set network.dns")
+
+
+def guest_ports(ports):
+    """'18080:8080' -> 8080. pasta lands host traffic on the netns port, and
+    TSI listens in the netns on the guest's own port, so map it 1:1."""
+    return [str(p).rsplit(":", 1)[-1] for p in ports]
+
+
+def pasta_network(net):
+    egress = net.get("egress")
+    ingress = net.get("ingress") or egress
+    if not egress:
+        die("network.egress must name an interface")
+    ipv6 = bool(net.get("ipv6", False))
+
+    v4 = iface_addrs(egress, "inet")
+    v6 = iface_addrs(egress, "inet6") if ipv6 else []
+    if not v4 and not v6:
+        die(f"egress interface {egress!r} has no usable global address")
+
+    opts = ["--config-net", "-q", "--dns", "none"]
+    if v4:
+        opts += ["--outbound-if4", egress]
+    if v6:
+        opts += ["--outbound-if6", egress]
+    if not v6:
+        opts += ["-4"]
+    elif not v4:
+        opts += ["-6"]
+    # Addresses/routes inside the netns are copied from this NIC. Defaults to
+    # egress; devices with no gateway (TUNs like socks0, p2p links)
+    # need a routable one here, while sockets stay bound to egress.
+    opts += ["-i", net.get("addr_from") or egress]
+    if not net.get("host_loopback", False):
+        # Don't let the sandbox reach host services via the gateway address.
+        opts += ["--no-map-gw"]
+
+    # pasta defaults to forwarding every host loopback listener into the netns
+    # (-T/-U auto); nothing should be reachable that the config didn't ask for.
+    opts += ["-T", "none", "-U", "none"]
+    tcp, udp = net.get("tcp", []), net.get("udp", [])
+    if not tcp:
+        opts += ["-t", "none"]
+    if not udp:
+        opts += ["-u", "none"]
+    if tcp or udp:
+        in_addrs = iface_addrs(ingress, "inet")
+        if ipv6:
+            in_addrs += iface_addrs(ingress, "inet6")
+        opts += port_specs("-t", tcp, ingress, in_addrs)
+        opts += port_specs("-u", udp, ingress, in_addrs)
+
+    return ["pasta"] + opts, egress, ingress
+
+
+# --- image (registry v2) -----------------------------------------------------
+
+MANIFEST_TYPES = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
+
+
+def parse_ref(ref):
+    """'alpine', 'docker.io/library/alpine:3', 'ghcr.io/x/y@sha256:..' ->
+    (registry host, repository, tag-or-digest)."""
+    name, _, digest = ref.partition("@")
+    tag = "latest"
+    if ":" in name.rsplit("/", 1)[-1]:
+        name, tag = name.rsplit(":", 1)
+    first, _, rest = name.partition("/")
+    if rest and ("." in first or ":" in first or first == "localhost"):
+        registry, repo = first, rest
+    else:
+        registry, repo = "docker.io", name
+    if registry == "docker.io":
+        registry = "registry-1.docker.io"
+        if "/" not in repo:
+            repo = "library/" + repo
+    return registry, repo, digest or tag
+
+
+class Registry:
+    def __init__(self, host, repo):
+        self.base = f"https://{host}/v2/{repo}"
+        self.token = None
+
+    def _auth(self, challenge):
+        # Bearer realm="...",service="...",scope="..." -> anonymous token
+        scheme, _, params = challenge.partition(" ")
+        if scheme.lower() != "bearer":
+            die(f"unsupported registry auth: {challenge}")
+        kv = dict(p.split("=", 1) for p in params.split(","))
+        kv = {k.strip(): v.strip().strip('"') for k, v in kv.items()}
+        realm = kv.pop("realm")
+        with urllib.request.urlopen(realm + "?" + urllib.parse.urlencode(kv)) as r:
+            body = json.load(r)
+        self.token = body.get("token") or body.get("access_token")
+
+    def get(self, path, accept=None):
+        for _ in range(2):
+            req = urllib.request.Request(self.base + path)
+            if accept:
+                req.add_header("Accept", accept)
+            if self.token:
+                req.add_header("Authorization", f"Bearer {self.token}")
+            try:
+                return urllib.request.urlopen(req)
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and not self.token and "WWW-Authenticate" in e.headers:
+                    self._auth(e.headers["WWW-Authenticate"])
+                    continue
+                die(f"registry: GET {self.base}{path}: {e.code} {e.reason}")
+        die(f"registry: GET {self.base}{path}: unauthorized")
+
+
+def tar_filter(member, dest):
+    """tarfile's 'tar' filter (no escaping dest, even through symlinks already
+    unpacked), minus device nodes we can't create unprivileged, plus u+rw(x)
+    so later layers and cache cleanup can modify what earlier ones wrote."""
+    if member.isdev() or member.isfifo():
+        return None
+    member = tarfile.tar_filter(member, dest)
+    if member.mode is not None:
+        member = member.replace(mode=member.mode | (0o700 if member.isdir() else 0o600))
+    return member
+
+
+def rm(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def extract_layer(fileobj, root):
+    with tarfile.open(fileobj=fileobj, mode="r|*") as tf:
+        for m in tf:
+            name = os.path.normpath(m.name.lstrip("/"))
+            if name == "." or name.startswith(".."):
+                continue
+            parent, base = os.path.split(name)
+            pdir = os.path.realpath(os.path.join(root, parent))
+            if pdir != root and not pdir.startswith(root + os.sep):
+                continue
+            # OCI whiteouts: .wh..wh..opq empties the dir, .wh.X deletes X.
+            if base == ".wh..wh..opq":
+                for e in os.listdir(pdir) if os.path.isdir(pdir) else []:
+                    rm(os.path.join(pdir, e))
+                continue
+            if base.startswith(".wh."):
+                rm(os.path.join(pdir, base[4:]))
+                continue
+            target = os.path.join(root, name)
+            if os.path.lexists(target) and not (m.isdir() and os.path.isdir(target)
+                                                and not os.path.islink(target)):
+                rm(target)
+            try:
+                tf.extract(m, root, filter=tar_filter)
+            except (tarfile.FilterError, OSError) as e:
+                print(f"ai-sand: skipping {m.name}: {e}", file=sys.stderr)
+
+
+def pull(image):
+    host, repo, ref = parse_ref(image)
+    reg = Registry(host, repo)
+    with reg.get(f"/manifests/{ref}", MANIFEST_TYPES) as r:
+        manifest = json.load(r)
+    if "manifests" in manifest:  # index: pick our platform
+        for m in manifest["manifests"]:
+            p = m.get("platform", {})
+            if p.get("os") == "linux" and p.get("architecture") == ARCH:
+                with reg.get(f"/manifests/{m['digest']}", MANIFEST_TYPES) as r:
+                    manifest = json.load(r)
+                break
+        else:
+            die(f"{image}: no linux/{ARCH} image in index")
+    digest = manifest["config"]["digest"]
+    dest = os.path.join(CACHE, "images", digest.replace(":", "-"))
+    if not os.path.isdir(os.path.join(dest, "rootfs")):
+        print(f"ai-sand: pulling {image} ({len(manifest['layers'])} layers)", file=sys.stderr)
+        os.makedirs(os.path.join(CACHE, "images"), exist_ok=True)
+        tmp = tempfile.mkdtemp(dir=os.path.join(CACHE, "images"), prefix=".pull-")
+        try:
+            rootfs = os.path.join(tmp, "rootfs")
+            os.mkdir(rootfs)
+            for layer in manifest["layers"]:
+                with reg.get(f"/blobs/{layer['digest']}") as r:
+                    extract_layer(r, os.path.realpath(rootfs))
+            with reg.get(f"/blobs/{digest}") as r:
+                config = r.read()
+            if "sha256:" + hashlib.sha256(config).hexdigest() != digest:
+                die(f"{image}: config digest mismatch")
+            with open(os.path.join(tmp, "config.json"), "wb") as f:
+                f.write(config)
+            rm(dest)
+            os.rename(tmp, dest)
+        finally:
+            rm(tmp)
+    refs = os.path.join(CACHE, "refs")
+    os.makedirs(refs, exist_ok=True)
+    link = os.path.join(refs, hashlib.sha256(image.encode()).hexdigest())
+    rm(link)
+    os.symlink(dest, link)
+    return dest
+
+
+def ensure_image(image, refresh):
+    link = os.path.join(CACHE, "refs", hashlib.sha256(image.encode()).hexdigest())
+    if not refresh and os.path.isdir(os.path.join(link, "rootfs")):
+        return os.path.realpath(link)
+    return pull(image)
+
+
+# --- plan (stage 1) ----------------------------------------------------------
+
+def expand(path):
+    return os.path.expanduser(os.path.expandvars(path))
+
+
+def read_stdin_args(nul):
+    data = sys.stdin.read()
+    if nul:
+        return [a for a in data.split("\0") if a]
+    return shlex.split(data)
+
+
+def build_plan(cfg, args):
+    preset_name = args.preset or cfg.get("preset")
+    presets = cfg.get("presets", {})
+    if not preset_name:
+        die("config has no `preset` knob and -p not given")
+    if preset_name not in presets:
+        die(f"preset {preset_name!r} not defined (have: {', '.join(presets) or 'none'})")
+    p = presets[preset_name]
+    if p.get("user"):
+        die(f"preset {preset_name!r}: `user` isn't supported without a container "
+            "engine; the guest runs as root (in a VM, in a userns)")
+
+    image = p.get("image") or die(f"preset {preset_name!r} has no image")
+    command = p.get("command", [])
+    if isinstance(command, str):
+        command = shlex.split(command)
+
+    # xargs semantics: preset command is the fixed prefix, extra args appended.
+    extra = list(args.args)
+    if args.xargs:
+        extra += read_stdin_args(args.null)
+
+    net = dict(cfg.get("network", {}))
+    net.update(p.get("network", {}))
+    if args.egress:
+        net["egress"] = args.egress
+    if args.ingress:
+        net["ingress"] = args.ingress
+    pasta, egress, ingress = pasta_network(net)
+
+    mounts = []
+    for m in p.get("mounts", []):
+        src, _, rest = m.partition(":")
+        dst, _, mode = rest.partition(":")
+        if not os.path.isabs(dst):
+            die(f"mount {m!r}: destination must be absolute")
+        mounts.append({"src": os.path.abspath(expand(src)), "dst": dst, "ro": mode == "ro"})
+
+    plan = {
+        "image": image,
+        "cpus": int(p.get("cpus", 2)),
+        "ram_mib": int(p.get("memory_mib", 2048)),
+        "read_only": bool(p.get("read_only", False)),
+        "workdir": p.get("workdir", ""),
+        "argv": command + extra,
+        "env": {k: expand(str(v)) for k, v in p.get("env", {}).items()},
+        "dns": net.get("dns") or host_resolvers(bool(net.get("ipv6", False))),
+        "ports": guest_ports(net.get("tcp", [])),
+        "mounts": mounts,
+    }
+    return plan, pasta, preset_name, egress, ingress
+
+
+# --- stage 2: inside pasta's userns + netns -----------------------------------
+
+libc = ctypes.CDLL(None, use_errno=True)
+PR_SET_PDEATHSIG, PR_SET_NO_NEW_PRIVS = 1, 38
+MS_RDONLY, MS_NOSUID, MS_NODEV, MS_REMOUNT, MS_BIND, MS_REC, MS_PRIVATE = (
+    1, 2, 4, 32, 4096, 16384, 1 << 18)
+
+
+def mount(src, target, fstype=None, flags=0, data=None):
+    enc = lambda s: s.encode() if s is not None else None
+    if libc.mount(enc(src), enc(target), enc(fstype), ctypes.c_ulong(flags), enc(data)) != 0:
+        e = ctypes.get_errno()
+        die(f"mount {src} -> {target}: {os.strerror(e)}", 1)
+
+
+def make_mountpoint(root, dst, is_dir):
+    path = os.path.join(root, dst.lstrip("/"))
+    if os.path.islink(path) or (os.path.lexists(path) and os.path.isdir(path) != is_dir):
+        rm(path)
+    if is_dir:
+        os.makedirs(path, exist_ok=True)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "a").close()
+    return path
+
+
+def cstrings(items):
+    arr = (ctypes.c_char_p * (len(items) + 1))()
+    arr[:-1] = [s.encode() for s in items]
+    arr[-1] = None
+    return arr
+
+
+def stage2(plan_path):
+    with open(plan_path) as f:
+        plan = json.load(f)
+    run = plan["run"]
+    with open(os.path.join(plan["image_dir"], "config.json")) as f:
+        icfg = json.load(f).get("config") or {}
+
+    # Private mount ns; everything below dies with this process.
+    os.unshare(os.CLONE_NEWNS)
+    mount(None, "/", None, MS_REC | MS_PRIVATE)
+    mount("ai-sand", run, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0700")
+    upper, work, root = (os.path.join(run, d) for d in ("upper", "work", "root"))
+    for d in (upper, work, root):
+        os.mkdir(d)
+    lower = os.path.join(plan["image_dir"], "rootfs")
+    mount("overlay", root, "overlay", 0,
+          f"lowerdir={lower},upperdir={upper},workdir={work},userxattr")
+
+    resolv = make_mountpoint(root, "/etc/resolv.conf", False)
+    with open(resolv, "w") as f:
+        f.write("".join(f"nameserver {d}\n" for d in plan["dns"]))
+    binds = [(m, make_mountpoint(root, m["dst"], os.path.isdir(m["src"])))
+             for m in plan["mounts"]]
+    if plan["workdir"]:
+        make_mountpoint(root, plan["workdir"], True)
+    if plan["read_only"]:
+        mount(None, root, None, MS_REMOUNT | MS_BIND | MS_RDONLY)
+    for m, target in binds:
+        mount(m["src"], target, None, MS_BIND | MS_REC)
+        if m["ro"]:
+            mount(None, target, None, MS_REMOUNT | MS_BIND | MS_RDONLY)
+
+    env = dict(e.split("=", 1) for e in icfg.get("Env") or [])
+    env.setdefault("PATH", DEFAULT_PATH)
+    env.setdefault("HOME", "/root")
+    if os.environ.get("TERM"):
+        env.setdefault("TERM", os.environ["TERM"])
+    env.update(plan["env"])
+    argv = plan["argv"] or (icfg.get("Entrypoint") or []) + (icfg.get("Cmd") or [])
+    if not argv:
+        die("nothing to run: preset has no command and image has no entrypoint")
+    workdir = plan["workdir"] or icfg.get("WorkingDir") or "/"
+
+    libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+    # The VMM ignores SIGTERM; make sure it can't outlive pasta.
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    if os.getppid() == 1:
+        sys.exit(1)
+
+    krun = ctypes.CDLL("libkrun.so.1")
+    ctx = krun.krun_create_ctx()
+    if ctx < 0:
+        die(f"krun_create_ctx: {os.strerror(-ctx)}", 1)
+
+    def call(fn, *a):
+        rc = getattr(krun, fn)(ctx, *a)
+        if rc < 0:
+            die(f"{fn}: {os.strerror(-rc)}", 1)
+
+    call("krun_set_vm_config", ctypes.c_uint8(plan["cpus"]), ctypes.c_uint32(plan["ram_mib"]))
+    call("krun_set_root", root.encode())
+    call("krun_set_workdir", workdir.encode())
+    # Empty list = expose only these ports (NULL would expose every listener).
+    call("krun_set_port_map", cstrings([f"{p}:{p}" for p in plan["ports"]]))
+    # krun_set_exec would ship argv/env on the kernel command line, which
+    # mangles quotes; the guest init reads this file instead when it's unset.
+    with open(os.path.join(upper, ".krun_config.json"), "w") as f:
+        json.dump({"Cmd": argv, "Env": [f"{k}={v}" for k, v in env.items()],
+                   "WorkingDir": workdir}, f)
+    call("krun_set_env", cstrings([]))
+    os.unlink(plan_path)
+    rc = krun.krun_start_enter(ctx)  # only returns on failure
+    die(f"krun_start_enter: {os.strerror(-rc)}", 1)
+
+
+# --- main ----------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--stage2":
+        return stage2(sys.argv[2])
+
+    ap = argparse.ArgumentParser(
+        prog="ai-sand",
+        description="Run the configured preset command in a libkrun microVM, "
+                    "appending ARGS xargs-style.",
+    )
+    ap.add_argument("-c", "--config", help="config file (default: $AI_SAND_CONFIG, ./ai-sand.toml, ~/.config/ai-sand/config.toml)")
+    ap.add_argument("-p", "--preset", help="override the config's `preset` knob")
+    ap.add_argument("-e", "--egress", metavar="IFACE", help="override egress interface")
+    ap.add_argument("-i", "--ingress", metavar="IFACE", help="override ingress interface")
+    ap.add_argument("-x", "--xargs", action="store_true", help="also read args from stdin, like xargs")
+    ap.add_argument("-0", "--null", action="store_true", help="with -x, args on stdin are NUL-separated")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="print the pasta command and VM plan, don't run")
+    ap.add_argument("-l", "--list", action="store_true", help="list presets and exit")
+    ap.add_argument("--pull", action="store_true", help="re-resolve the image tag and pull if it changed")
+    ap.add_argument("args", nargs=argparse.REMAINDER, help="appended to the preset command")
+    args = ap.parse_args()
+    if args.args and args.args[0] == "--":
+        args.args = args.args[1:]
+
+    cfg, cfg_path = load_config(args.config)
+
+    if args.list:
+        active = args.preset or cfg.get("preset")
+        for name, p in cfg.get("presets", {}).items():
+            mark = "*" if name == active else " "
+            print(f"{mark} {name:16} {p.get('image', '?'):40} {shlex.join(p.get('command', [])) if isinstance(p.get('command'), list) else p.get('command', '')}")
+        return 0
+
+    plan, pasta, preset, egress, ingress = build_plan(cfg, args)
+    stage2_cmd = [sys.executable, "-I", os.path.abspath(__file__), "--stage2"]
+    if args.dry_run:
+        print(shlex.join(pasta + ["--"] + stage2_cmd + ["PLAN"]))
+        print(json.dumps(plan, indent=2))
+        return 0
+
+    plan["image_dir"] = ensure_image(plan["image"], args.pull)
+    os.makedirs(RUNTIME, mode=0o700, exist_ok=True)
+    plan["run"] = tempfile.mkdtemp(dir=RUNTIME, prefix=f"{preset}-")
+    plan_path = plan["run"] + ".json"
+    with open(plan_path, "w") as f:
+        json.dump(plan, f)
+
+    print(f"ai-sand: preset={preset} egress={egress} ingress={ingress} ({cfg_path})", file=sys.stderr)
+    # stdin is consumed for args in xargs mode, so don't hand it to the VM.
+    stdin = subprocess.DEVNULL if args.xargs else None
+    # pasta (and with it the VM) goes down with us, even on SIGKILL.
+    proc = subprocess.Popen(pasta + ["--"] + stage2_cmd + [plan_path], stdin=stdin,
+                            preexec_fn=lambda: libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda s, _: proc.send_signal(s))
+    try:
+        while True:
+            try:
+                return proc.wait()
+            except KeyboardInterrupt:
+                pass  # the tty's ^C reached pasta and the guest too; keep waiting
+    finally:
+        rm(plan_path)
+        os.rmdir(plan["run"])  # the tmpfs on it was in the run's mount ns
+
+
+if __name__ == "__main__":
+    sys.exit(main())

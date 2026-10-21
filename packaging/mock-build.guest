@@ -1,0 +1,37 @@
+# Runs inside the mock-build VM: /src/packaging (specs, ro), /out (dist/, rw).
+set -euo pipefail
+# Results as the invoking host user (guest root), not mock's guest ids.
+trap 'chown -R 0:0 /out' EXIT
+
+dnf -y -q --setopt=install_weak_deps=False install mock rpm-build rpmlint >/dev/null
+# Buildroots on guest tmpfs: real mknod/chroot, nothing lands on the host.
+for d in /var/lib/mock /var/cache/mock; do
+    mkdir -p "$d" && mount -t tmpfs tmpfs "$d"
+done
+
+roots=("$@")
+[[ ${#roots[@]} -gt 0 ]] || roots=("fedora-$(rpm -E %fedora)-$(uname -m)")
+
+for root in "${roots[@]}"; do
+    out=/out/$root
+    mkdir -p "$out"
+    for spec in /src/packaging/*.spec; do
+        name=$(basename "$spec" .spec)
+        echo "== $root: $name"
+        srpm=$(rpmbuild -bs --define "_sourcedir /out/src" --define "_srcrpmdir /tmp/srpm" \
+               --define "dist $(rpm -E %dist)" "$spec" | sed -n 's/^Wrote: //p')
+        # No podman in here: build the bootstrap chroot with dnf instead.
+        mock -r "$root" --isolation=simple --no-bootstrap-image --quiet \
+             --resultdir "$out/$name" --rebuild "$srpm"
+    done
+    echo "== $root: rpmlint"
+    rpmlint -r /src/packaging/rpmlintrc "$out"/*/*.rpm || true
+done
+
+# Deps must resolve from the stock repos and the binaries must run.
+echo "== install test"
+# The image sets tsflags=nodocs; the example config ships as %doc.
+dnf -y -q --setopt=install_weak_deps=False --setopt=tsflags= install "/out/${roots[0]}"/*/*.noarch.rpm >/dev/null
+krun-sand -c /usr/share/doc/krun-sand/krun-sand.toml -l
+rpm -q krun-sand socks-tun
+systemd-analyze verify /usr/lib/systemd/system/socks-tun.service 2>&1 | grep -v 'network-online\|tor.service' || true

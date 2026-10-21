@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# mock-build: build the RPMs with mock inside a throwaway krun-sand Fedora VM.
+#
+#   packaging/mock-build [MOCK_ROOT...]     default: fedora-<image release>-<arch>
+#
+# Results: dist/<mock root>/ (SRPMs, RPMs, logs), dist/src/ (tarball).
+# Env: EGRESS (default: NIC of the default route), IMAGE, KRUN_SAND.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+top=$(cd "$here/.." && pwd)
+dist=$top/dist
+krun_sand=${KRUN_SAND:-$top/krun-sand}
+image=${IMAGE:-registry.fedoraproject.org/fedora:44}
+egress=${EGRESS:-$(ip route get 1.1.1.1 | sed -n 's/.* dev \([^ ]*\).*/\1/p')}
+version=$(sed -n 's/^Version:\s*//p' "$here/krun-sand.spec")
+
+# Tracked files incl. uncommitted edits, as GitHub's v$version archive lays them out.
+rm -rf "$dist"
+mkdir -p "$dist/src"
+tree=$(git -C "$top" stash create)
+git -C "$top" archive --prefix="krun-sand-$version/" \
+    -o "$dist/src/krun-sand-$version.tar.gz" "${tree:-HEAD}"
+
+cfg=$(mktemp --suffix=.toml)
+trap 'rm -f "$cfg"' EXIT
+cat > "$cfg" <<EOF
+preset = "mock"
+[network]
+egress = "$egress"
+[presets.mock]
+image = "$image"
+command = ["bash", "/src/packaging/mock-build.guest"]
+cpus = $(( $(nproc) < 8 ? $(nproc) : 8 ))
+memory_mib = 8192
+mounts = ["$top/packaging:/src/packaging:ro", "$dist:/out"]
+EOF
+
+"$krun_sand" -c "$cfg" -- "$@" </dev/null

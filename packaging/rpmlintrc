@@ -1,0 +1,2 @@
+# Jargon in Summary/%description, not typos.
+addFilter("spelling-error")
